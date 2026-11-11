@@ -54,6 +54,15 @@ BASE_PAYLOAD = {
 }
 
 
+@pytest.fixture(autouse=True)
+def _disable_external_ai(monkeypatch):
+    """Keep the suite hermetic: never call Gemini, even if `.env` has a key."""
+
+    monkeypatch.setenv("AUDITOR_AI_ENABLED", "false")
+    monkeypatch.delenv("AI_KEY", raising=False)
+    monkeypatch.delenv("AUDITOR_AI_KEY", raising=False)
+
+
 @pytest.fixture
 def payload() -> dict:
     return copy.deepcopy(BASE_PAYLOAD)

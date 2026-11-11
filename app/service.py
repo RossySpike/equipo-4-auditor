@@ -1,11 +1,13 @@
-"""Audit orchestration: checks -> score -> verdict -> signing."""
+"""Audit orchestration: checks -> optional Gemini review -> score -> verdict."""
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 
 from .checks import CheckOutcome, run_checks
 from .config import Settings
+from .gemini import AuditAI, build_gemini_auditor, reconcile_outcomes
 from .models import (
     AuditOutput,
     AuditRequest,
@@ -19,6 +21,8 @@ from .signing import (
     generate_approval_id,
     sign_content_hash,
 )
+
+logger = logging.getLogger(__name__)
 
 ROUTING_PRIORITY = ("AG-EST", "AG-BOR", "AG-COP")
 
@@ -43,11 +47,38 @@ def _dedupe_sources(outcomes: list[CheckOutcome]) -> list[DataSource]:
     return sources
 
 
-def run_audit(request: AuditRequest, settings: Settings) -> AuditResponse:
+def run_audit(
+    request: AuditRequest,
+    settings: Settings,
+    ai_auditor: AuditAI | None = None,
+) -> AuditResponse:
     """Evaluate one invocation and build the contract response."""
 
     started_at = datetime.now(timezone.utc)
     outcomes = run_checks(request)
+
+    warnings: list[str] = []
+    if settings.using_development_key:
+        warnings.append(
+            "AUDITOR_SIGNING_KEY no está configurada; se usa una clave de desarrollo."
+        )
+
+    if settings.ai_enabled:
+        auditor = ai_auditor or build_gemini_auditor(settings)
+        if auditor is None:
+            warnings.append(
+                "AUDITOR_AI_ENABLED está activo pero AI_KEY no está configurada; "
+                "se usó la auditoría determinista."
+            )
+        else:
+            try:
+                outcomes = reconcile_outcomes(outcomes, auditor.review(request))
+            except Exception as exc:  # noqa: BLE001 - fallback is the contract
+                logger.warning("Gemini audit unavailable: %s", type(exc).__name__)
+                warnings.append(
+                    "La revisión con Gemini no está disponible; "
+                    "se usó la auditoría determinista."
+                )
 
     penalty = sum(outcome.weight for outcome in outcomes if not outcome.passed)
     score = max(0, 100 - penalty)
@@ -72,12 +103,6 @@ def run_audit(request: AuditRequest, settings: Settings) -> AuditResponse:
         if not outcome.passed
     ]
 
-    warnings: list[str] = []
-    if settings.using_development_key:
-        warnings.append(
-            "AUDITOR_SIGNING_KEY no está configurada; se usa una clave de desarrollo."
-        )
-
     copy_payload = request.input.copy_payload
     if approved:
         content_hash = compute_content_hash(
@@ -93,7 +118,9 @@ def run_audit(request: AuditRequest, settings: Settings) -> AuditResponse:
             return_to=None,
             approval_id=generate_approval_id(started_at),
             content_hash=content_hash,
-            content_signature=sign_content_hash(content_hash, settings.signing_key),
+            content_signature=sign_content_hash(
+                content_hash, settings.resolved_signing_key
+            ),
         )
         status = "completed"
     else:
